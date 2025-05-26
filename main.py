@@ -87,10 +87,11 @@ class AudioDataset(Dataset):
             n_mels=64
         )(waveform)
 
-        # Resize to (1, 128, 128)
-        mel_spectrogram = mel_spectrogram.unsqueeze(0) 
-        mel_spectrogram = torch.nn.functional.interpolate(mel_spectrogram, size=(128, 128))
-        mel_spectrogram = mel_spectrogram.squeeze(0)  
+        mel_spectrogram = torch.nn.functional.interpolate(
+            mel_spectrogram, size=(128,128), mode='bilinear',align_corners=False
+        ) 
+
+        mel_spectrogram = mel_spectrogram.repeat(3,1,1)
         
 
         if self.transform:
