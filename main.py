@@ -127,7 +127,7 @@ def main(args):
 
 
     # Model summary
-    summary = torchinfo.summary(model, input_size=(1, 1, 128, 128))
+    summary = torchinfo.summary(model, input_size=(1, 3, 128, 128))
     run.config['total_params'] = summary.total_params
     run.config['mult_adds'] = summary.total_mult_adds
 
