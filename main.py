@@ -1,23 +1,25 @@
 import os
-import sys
 import torch
 import torchaudio
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 import wandb
-from torch.utils.data import DataLoader
-from torchvision.transforms import v2
-from torch.utils.data import Dataset
-from torchvision.transforms.v2 import ToDtype
 import argparse
 import torchinfo
-
-# Disable beta transform warnings
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import v2
+from torchvision.transforms.v2 import ToDtype
 from torchvision import disable_beta_transforms_warning
 disable_beta_transforms_warning()
 
-# MixUp for spectrograms
+# ─────── Constants ─────── #
+SAMPLE_RATE = 22050
+N_MFCC = 40
+N_FFT = 1024
+HOP_LENGTH = 512
+MAX_TIME_STEPS = 400
+
+# ─────── MixUp ─────── #
 mixup = v2.MixUp(num_classes=10)
 
 def mixup_collate_fn(batch):
@@ -26,7 +28,7 @@ def mixup_collate_fn(batch):
 def conf_collate_fn(mixup_enabled):
     return mixup_collate_fn if mixup_enabled else torch.utils.data.default_collate
 
-# Custom CNN instead of ResNet
+# ─────── CNN Model ─────── #
 class CustomCNN(nn.Module):
     def __init__(self):
         super(CustomCNN, self).__init__()
@@ -44,28 +46,19 @@ class CustomCNN(nn.Module):
             nn.BatchNorm2d(128),
             nn.MaxPool2d(2),
         )
-
         self.classifier = nn.Sequential(
-    nn.Flatten(),
-    nn.Linear(128 * 16 * 16, 256),  # Correct shape
-    nn.ReLU(),
-    nn.Dropout(0.5),
-    nn.Linear(256, 2)
-)
+            nn.Flatten(),
+            nn.Linear(128 * 16 * 16, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 2)
+        )
 
     def forward(self, x):
         x = self.features(x)
-        x = self.classifier(x)
-        return x
+        return self.classifier(x)
 
-# Constants
-SAMPLE_RATE = 22050
-N_MFCC = 40
-N_FFT = 2048
-HOP_LENGTH = 512
-MAX_TIME_STEPS = 400
-
-# Custom Dataset for audio files
+# ─────── Dataset ─────── #
 class AudioDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.samples = []
@@ -86,73 +79,60 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         file_path, label = self.samples[idx]
         waveform, _ = torchaudio.load(file_path)
-        waveform = waveform.mean(dim=0, keepdim=True)  # mono: (1, N)
+        waveform = waveform.mean(dim=0, keepdim=True)
 
-        # Compute Mel spectrogram
         mel_spec = torchaudio.transforms.MelSpectrogram(
             sample_rate=SAMPLE_RATE,
             n_fft=N_FFT,
             hop_length=HOP_LENGTH,
             n_mels=64
-        )(waveform)  # shape: [1, 64, time]
+        )(waveform)
 
-        # Ensure consistent time dimension
-        mel_spec = mel_spec[..., :MAX_TIME_STEPS]  # trim or pad
+        mel_spec = mel_spec[..., :MAX_TIME_STEPS]
         if mel_spec.shape[-1] < MAX_TIME_STEPS:
             pad_amt = MAX_TIME_STEPS - mel_spec.shape[-1]
             mel_spec = torch.nn.functional.pad(mel_spec, (0, pad_amt))
 
-        # Resize to (1, 128, 128) and convert to 3 channels
+        mel_spec = mel_spec.unsqueeze(0)
         mel_spec = torch.nn.functional.interpolate(mel_spec, size=(128, 128), mode='bilinear', align_corners=False)
-        mel_spec = mel_spec.repeat(3, 1, 1)  # to shape [3, 128, 128]
+        mel_spec = mel_spec.squeeze(0).repeat(3, 1, 1)
 
         if self.transform:
             mel_spec = self.transform(mel_spec)
 
-        print(mel_spec.shape)
-
         return mel_spec, label
 
+# ─────── Main Training Function ─────── #
 def main(args):
     print("code started")
-    run = wandb.init(project="audio-spectrogram-resnet", config=vars(args))
+    run = wandb.init(project="deepfake-audio-spectrogram", config=vars(args))
     config = wandb.config
-
-    # preproc = v2.Compose([
-    #     v2.RandomHorizontalFlip(p=0.5),
-    #     ToDtype(torch.float32, scale=True)
-    # ])
 
     collate_fn = conf_collate_fn(config.mixup)
 
-    # Load dataset
     train_path = os.path.join(os.path.dirname(__file__), 'datasets/audio/train')
     test_path = os.path.join(os.path.dirname(__file__), 'datasets/audio/test')
 
-    print("data loaded ")
+    print("data loaded")
 
     train_data = AudioDataset(train_path)
     test_data = AudioDataset(test_path, transform=ToDtype(torch.float32, scale=True))
 
-    print("data converted ")
+    print("data converted")
 
     train_loader = DataLoader(train_data, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
     test_loader = DataLoader(test_data, batch_size=config.batch_size, shuffle=False)
 
-
-    # Model selection override: always use CustomCNN
     model = CustomCNN()
 
-
-    # Model summary
     summary = torchinfo.summary(model, input_size=(1, 3, 128, 128))
     run.config['total_params'] = summary.total_params
     run.config['mult_adds'] = summary.total_mult_adds
 
     print("model begin training")
 
-    # Training setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(device)
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=config.learning_rate,
@@ -177,7 +157,6 @@ def main(args):
         scheduler.step()
         avg_train_loss = total_train_loss / len(train_loader)
 
-        # Evaluation
         model.eval()
         correct, total = 0, 0
         total_test_loss = 0.0
@@ -206,9 +185,9 @@ def main(args):
 
         print(f"[{epoch+1}/{config.epochs}] Accuracy: {accuracy:.4f}")
 
-    # Save model
     torch.save(model.state_dict(), config.chkpt_path + run.id + '.pt')
 
+# ─────── Entry Point ─────── #
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-b", "--batch_size", type=int, default=16)
