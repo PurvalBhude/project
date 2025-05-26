@@ -46,17 +46,24 @@ class CustomCNN(nn.Module):
         )
 
         self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 16 * 16, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 2)
-        )
+    nn.Flatten(),
+    nn.Linear(128 * 16 * 16, 256),  # Correct shape
+    nn.ReLU(),
+    nn.Dropout(0.5),
+    nn.Linear(256, 2)
+)
 
     def forward(self, x):
         x = self.features(x)
         x = self.classifier(x)
         return x
+
+# Constants
+SAMPLE_RATE = 22050
+N_MFCC = 40
+N_FFT = 2048
+HOP_LENGTH = 512
+MAX_TIME_STEPS = 400
 
 # Custom Dataset for audio files
 class AudioDataset(Dataset):
@@ -78,26 +85,33 @@ class AudioDataset(Dataset):
 
     def __getitem__(self, idx):
         file_path, label = self.samples[idx]
-        waveform, sample_rate = torchaudio.load(file_path)
-        waveform = waveform.mean(dim=0, keepdim=True)  # Convert to mono
+        waveform, _ = torchaudio.load(file_path)
+        waveform = waveform.mean(dim=0, keepdim=True)  # mono: (1, N)
 
-        # Convert to MelSpectrogram
-        mel_spectrogram = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sample_rate,
+        # Compute Mel spectrogram
+        mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=SAMPLE_RATE,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH,
             n_mels=64
-        )(waveform)
+        )(waveform)  # shape: [1, 64, time]
 
-        mel_spectrogram = torch.nn.functional.interpolate(
-            mel_spectrogram, size=(128,128), mode='bilinear',align_corners=False
-        ) 
+        # Ensure consistent time dimension
+        mel_spec = mel_spec[..., :MAX_TIME_STEPS]  # trim or pad
+        if mel_spec.shape[-1] < MAX_TIME_STEPS:
+            pad_amt = MAX_TIME_STEPS - mel_spec.shape[-1]
+            mel_spec = torch.nn.functional.pad(mel_spec, (0, pad_amt))
 
-        mel_spectrogram = mel_spectrogram.repeat(3,1,1)
-        
+        # Resize to (1, 128, 128) and convert to 3 channels
+        mel_spec = torch.nn.functional.interpolate(mel_spec, size=(128, 128), mode='bilinear', align_corners=False)
+        mel_spec = mel_spec.repeat(3, 1, 1)  # to shape [3, 128, 128]
 
         if self.transform:
-            mel_spectrogram = self.transform(mel_spectrogram)
+            mel_spec = self.transform(mel_spec)
 
-        return mel_spectrogram, label
+        print(mel_spec.shape)
+
+        return mel_spec, label
 
 def main(args):
     print("code started")
