@@ -10,3 +10,6 @@
 # do every part that need to be done such as activating python environment and running the script
 source .venv/bin/activate
 srun python3 main.py
+
+
+# 45b695422df2b3e1e26f4d5d462efc9b7b8b2fb8
