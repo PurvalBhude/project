@@ -44,9 +44,10 @@ class CustomCNN(nn.Module):
             nn.BatchNorm2d(128),
             nn.MaxPool2d(2),
         )
+
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * 8 * 8, 256),  # Adjust if input shape differs
+            nn.Linear(128 * 16 * 16, 256),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(256, 2)
