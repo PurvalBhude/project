@@ -4,3 +4,8 @@ torchvision>=0.15.0
 numpy
 wandb
 torchinfo
+librosa
+opencv-python
+scikit-learn
+matplotlib
+seaborn
