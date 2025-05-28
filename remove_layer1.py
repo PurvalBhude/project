@@ -1,6 +1,6 @@
 import os
 import torch
-import torchaudio # Still useful for potential future audio ops, though librosa is used for features here
+import torchaudio
 import torch.nn as nn
 import torch.optim as optim
 import wandb
@@ -14,40 +14,46 @@ import cv2
 from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
 import matplotlib.pyplot as plt
 import seaborn as sns
-# import gc # Not strictly needed for PyTorch, Python's GC handles this.
 
 # ─────── Constants ─────── #
 SAMPLE_RATE = 22050
-N_MELS = 128 # From notebook
-N_FFT = 2048 # From notebook
+N_MFCC = 40
+N_MELS = 128
+N_FFT = 2048
 HOP_LENGTH = 512
-MAX_TIME_STEPS = 400 # From notebook (for resizing spectrogram width)
+MAX_TIME_STEPS = 400
 
-# ─────── CNN Model ─────── #
+# ─────── CNN Model (Modified to remove one layer) ─────── #
 class CustomCNN(nn.Module):
     def __init__(self):
         super(CustomCNN, self).__init__()
         self.features = nn.Sequential(
-            # Input channel changed from 3 to 1 to match notebook's single-channel spectrogram
+            # First Convolutional Block
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32), # Batch norm after Conv, before ReLU (notebook style)
+            nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.MaxPool2d(2), # Output: (32, 64, 200) from (1, 128, 400)
-            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.MaxPool2d(2), # Output: (32, 84, 200) from (1, 168, 400)
+
+            # Second Convolutional Block (Now the last one before flattening)
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(2), # Output: (64, 32, 100)
+            nn.MaxPool2d(2), # Output: (64, 42, 100)
+
+            # The third convolutional block has been removed to make the model lighter.
             # nn.Conv2d(64, 128, kernel_size=3, padding=1),
             # nn.BatchNorm2d(128),
             # nn.ReLU(),
-            # nn.MaxPool2d(2), # Output: (128, 16, 50)
+            # nn.MaxPool2d(2), # Original Output: (128, 21, 50)
         )
         self.classifier = nn.Sequential(
+            # Adjust input features for Flatten based on the new output size from the last MaxPool2d
+            # Now, the output from 'features' will be (64 channels * 42 height * 100 width)
             nn.Flatten(),
-            nn.Linear(64 * 32 * 100, 256),
+            nn.Linear(64 * 42 * 100, 256), # Updated linear layer input size
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(256, 2) # Output for 2 classes
+            nn.Linear(256, 2)
         )
 
     def forward(self, x):
@@ -75,39 +81,35 @@ class AudioDataset(Dataset):
         file_path, label = self.samples[idx]
         
         try:
-            # Load audio using librosa as in the notebook
             audio, sr = librosa.load(file_path, sr=SAMPLE_RATE)
 
-            # Compute Mel Spectrogram as in the notebook
             mel_spec = librosa.feature.melspectrogram(y=audio, sr=sr, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP_LENGTH)
             mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
 
-            # Resize to Fixed Time Dimension (MAX_TIME_STEPS) and N_MELS as in the notebook
-            # cv2.resize expects (width, height)
-            mel_spec = cv2.resize(mel_spec, (MAX_TIME_STEPS, N_MELS)) # (400, 128)
+            mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH)
 
-            # Normalize Features as in the notebook
+            mel_spec = cv2.resize(mel_spec, (MAX_TIME_STEPS, N_MELS))
+            mfcc = cv2.resize(mfcc, (MAX_TIME_STEPS, N_MFCC))
+
             mel_spec = (mel_spec - np.mean(mel_spec)) / np.std(mel_spec)
+            mfcc = (mfcc - np.mean(mfcc)) / np.std(mfcc)
 
-            # Convert to PyTorch tensor and add channel dimension (1 channel)
-            mel_spec = torch.from_numpy(mel_spec).float().unsqueeze(0) # Shape: (1, 128, 400)
+            combined_features = np.vstack((mel_spec, mfcc))
+            combined_features = torch.from_numpy(combined_features).float().unsqueeze(0)
 
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
-            # Return a dummy tensor and label if loading fails to prevent DataLoader errors
-            # In a real scenario, you might skip or handle this more robustly
-            mel_spec = torch.zeros((1, N_MELS, MAX_TIME_STEPS), dtype=torch.float32)
-            label = -1 # Indicate an error or skip in collate_fn if desired
+            combined_features = torch.zeros((1, N_MELS + N_MFCC, MAX_TIME_STEPS), dtype=torch.float32)
+            label = -1 
 
-        return mel_spec, label
+        return combined_features, label
 
 # ─────── Main Training Function ─────── #
 def main(args):
     print("code started")
-    run = wandb.init(project="deepfake-audio-spectrogram-notebook-conversion", config=vars(args))
+    run = wandb.init(project="deepfake-audio-spectrogram-mfcc-less-heavy", config=vars(args)) # Updated project name
     config = wandb.config
-
-    # Define paths
+    
     script_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
     train_path = os.path.join(script_dir, 'datasets/audio/train')
     test_path = os.path.join(script_dir, 'datasets/audio/test')
@@ -125,9 +127,13 @@ def main(args):
     model = CustomCNN()
 
     # Input size for torchinfo summary: (batch_size, channels, height, width)
-    summary = torchinfo.summary(model, input_size=(1, 1, N_MELS, MAX_TIME_STEPS))
+    # Height is N_MELS + N_MFCC
+    summary = torchinfo.summary(model, input_size=(1, 1, N_MELS + N_MFCC, MAX_TIME_STEPS))
     run.config['total_params'] = summary.total_params
     run.config['mult_adds'] = summary.total_mult_adds
+    print(f"Model Total Parameters: {summary.total_params}")
+    print(f"Model Multiply-Adds: {summary.total_mult_adds}")
+
 
     print("model begin training")
 
@@ -137,19 +143,21 @@ def main(args):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     
-    # Learning Rate Scheduler and Early Stopping as per notebook
-    # Removed 'verbose=True' as it causes TypeError in newer PyTorch versions
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6) 
     
     best_val_loss = float('inf')
     patience_counter = 0
-    early_stopping_patience = 5 # From notebook's EarlyStopping
+    early_stopping_patience = 5
 
     for epoch in range(config.epochs):
         model.train()
         total_train_loss = 0.0
 
         for batch_idx, (inputs, labels) in enumerate(train_loader):
+            if (labels == -1).any():
+                print(f"Skipping batch {batch_idx} due to error in data loading.")
+                continue
+
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -169,17 +177,21 @@ def main(args):
 
         with torch.no_grad():
             for inputs, labels in test_loader:
+                if (labels == -1).any():
+                    print(f"Skipping batch {batch_idx} in evaluation due to error in data loading.")
+                    continue
+
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
                 total_test_loss += loss.item()
                 
-                probabilities = torch.softmax(outputs, dim=1) # Get probabilities for ROC AUC
-                _, predicted = torch.max(outputs, 1) # Get predicted class for accuracy
+                probabilities = torch.softmax(outputs, dim=1)
+                _, predicted = torch.max(outputs, 1)
 
                 all_labels.extend(labels.cpu().numpy())
                 all_predictions.extend(predicted.cpu().numpy())
-                all_probabilities.extend(probabilities[:, 1].cpu().numpy()) # Probabilities for the positive class
+                all_probabilities.extend(probabilities[:, 1].cpu().numpy())
 
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
@@ -187,14 +199,11 @@ def main(args):
         avg_test_loss = total_test_loss / len(test_loader)
         accuracy = correct / total
 
-        # Learning Rate Scheduler step based on validation loss
         scheduler.step(avg_test_loss)
 
-        # Early Stopping check
         if avg_test_loss < best_val_loss:
             best_val_loss = avg_test_loss
             patience_counter = 0
-            # Save the best model
             torch.save(model.state_dict(), config.chkpt_path + run.id + '_best_model.pt')
             print(f"[{epoch+1}/{config.epochs}] Validation loss improved. Saving model.")
         else:
@@ -202,7 +211,7 @@ def main(args):
             print(f"[{epoch+1}/{config.epochs}] Validation loss did not improve. Patience: {patience_counter}/{early_stopping_patience}")
             if patience_counter >= early_stopping_patience:
                 print(f"Early stopping triggered after {epoch+1} epochs.")
-                break # Exit training loop
+                break
 
         wandb.log({
             'epoch': epoch,
@@ -214,13 +223,11 @@ def main(args):
 
         print(f"[{epoch+1}/{config.epochs}] Train Loss: {avg_train_loss:.4f}, Test Loss: {avg_test_loss:.4f}, Test Accuracy: {accuracy:.4f}")
 
-    # Load best model for final evaluation if early stopping occurred
     if os.path.exists(config.chkpt_path + run.id + '_best_model.pt'):
         model.load_state_dict(torch.load(config.chkpt_path + run.id + '_best_model.pt'))
         model.eval()
         print("Loaded best model for final evaluation.")
     
-    # Final Evaluation Metrics (as in notebook)
     y_true = np.array(all_labels)
     y_pred_classes = np.array(all_predictions)
     y_scores = np.array(all_probabilities)
@@ -237,7 +244,7 @@ def main(args):
     plt.title("Confusion Matrix")
     wandb.log({"confusion_matrix": wandb.Image(plt)})
     plt.show()
-    plt.close() # Close plot to prevent display issues in some environments
+    plt.close()
 
     print("\n─────── ROC Curve ───────")
     fpr, tpr, _ = roc_curve(y_true, y_scores)
@@ -254,7 +261,7 @@ def main(args):
     plt.legend(loc='lower right')
     wandb.log({"roc_curve": wandb.Image(plt)})
     plt.show()
-    plt.close() # Close plot
+    plt.close()
     
     print(f"✅ Model AUC Score: {roc_auc:.4f}")
     wandb.log({'final_auc_score': roc_auc})
@@ -268,11 +275,11 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--batch_size", type=int, default=16)
     parser.add_argument("-e", "--epochs", type=int, default=50)
     parser.add_argument("-lr", "--learning_rate", type=float, default=3e-4)
-    parser.add_argument("-m", "--momentum", type=float, default=0.0) # Inert for Adam
-    parser.add_argument("-wd", "--weight_decay", type=float, default=0.0) # Inert for Adam defaults
-    parser.add_argument("--depth", type=int, default=18) # Inert for CustomCNN
-    parser.add_argument("--width", type=int, default=64) # Inert for CustomCNN
-    parser.add_argument("--groups", type=int, default=1) # Inert for CustomCNN
+    parser.add_argument("-m", "--momentum", type=float, default=0.0)
+    parser.add_argument("-wd", "--weight_decay", type=float, default=0.0)
+    parser.add_argument("--depth", type=int, default=18)
+    parser.add_argument("--width", type=int, default=64)
+    parser.add_argument("--groups", type=int, default=1)
     parser.add_argument("--chkpt_path", type=str, default="./")
     args = parser.parse_args()
     main(args)
